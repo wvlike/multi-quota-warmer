@@ -1,12 +1,15 @@
 package main
 
 import (
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -23,19 +26,25 @@ import (
 const (
 	pluginID       = "multi-quota-warmer"
 	pluginName     = "Multi-Provider Five-Hour Quota Warmer"
-	pluginVersion  = "0.3.0"
+	pluginVersion  = "0.3.1"
 	maxLogsDefault = 200
 
 	providerCodex       = "codex"
 	providerAntigravity = "antigravity"
 
-	defaultCodexModel         = "gpt-5.6-luna"
-	defaultCodexPrompt        = "Reply with exactly: quota window activated"
-	defaultAntigravityModel   = "gemini-3-flash"
-	defaultAntigravityPrompt  = "Explain how HTTP/2 stream multiplexing works in detail with concrete examples. Write at least 600 tokens across several paragraphs without summarizing early."
-	defaultTimezone           = "Asia/Singapore"
-	defaultLogPageSize        = 20
-	maxLogPageSize            = 200
+	defaultCodexModel        = "gpt-5.6-luna"
+	defaultCodexPrompt       = "Reply with exactly: quota window activated"
+	defaultAntigravityModel  = "gemini-3-flash"
+	defaultAntigravityPrompt = "Explain how HTTP/2 stream multiplexing works in detail with concrete examples. Write at least 600 tokens across several paragraphs without summarizing early."
+	defaultTimezone          = "Asia/Singapore"
+	defaultLogPageSize       = 20
+	maxLogPageSize           = 200
+
+	methodHostAuthModels          = "host.auth.models"
+	antigravityGenerateDailyURL   = "https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent"
+	antigravityEnvelopeUserAgent  = "antigravity"
+	antigravityWarmupUserAgent    = "antigravity/hub/2.29.0 (aidev_client; os_type=darwin; arch=arm64; cl=1013060670)"
+	antigravityLegacyHubUserAgent = "antigravity/hub/2.9.1 darwin/arm64"
 )
 
 var globalWarmer = newWarmer()
@@ -57,15 +66,15 @@ type pluginConfig struct {
 }
 
 type rawPluginConfig struct {
-	Enabled       bool                  `yaml:"enabled"`
-	Codex         *rawProviderConfig    `yaml:"codex"`
-	Antigravity   *rawProviderConfig    `yaml:"antigravity"`
-	Model         string                `yaml:"model"`
-	Prompt        string                `yaml:"prompt"`
-	Timezone      string                `yaml:"timezone"`
-	Schedules     []schedule            `yaml:"schedules"`
-	MaxLogEntries int                   `yaml:"max_log_entries"`
-	StateFile     string                `yaml:"state_file"`
+	Enabled       bool               `yaml:"enabled"`
+	Codex         *rawProviderConfig `yaml:"codex"`
+	Antigravity   *rawProviderConfig `yaml:"antigravity"`
+	Model         string             `yaml:"model"`
+	Prompt        string             `yaml:"prompt"`
+	Timezone      string             `yaml:"timezone"`
+	Schedules     []schedule         `yaml:"schedules"`
+	MaxLogEntries int                `yaml:"max_log_entries"`
+	StateFile     string             `yaml:"state_file"`
 }
 
 type rawProviderConfig struct {
@@ -113,23 +122,104 @@ type logPage struct {
 }
 
 type warmerStatus struct {
-	Plugin        string               `json:"plugin"`
-	Version       string               `json:"version"`
-	Running       bool                 `json:"running"`
-	Codex         providerWarmupConfig `json:"codex"`
-	Antigravity   providerWarmupConfig `json:"antigravity"`
-	Timezone      string               `json:"timezone"`
-	Schedules     []scheduledRun       `json:"schedules"`
-	LastRun       *time.Time           `json:"last_run,omitempty"`
-	LastSource    string               `json:"last_source,omitempty"`
-	LastResults   []warmResult         `json:"last_results"`
-	LogCount      int                  `json:"log_count"`
-	StateError    string               `json:"state_error,omitempty"`
-	Configuration pluginConfig         `json:"configuration"`
+	Plugin            string               `json:"plugin"`
+	Version           string               `json:"version"`
+	Running           bool                 `json:"running"`
+	Codex             providerWarmupConfig `json:"codex"`
+	Antigravity       providerWarmupConfig `json:"antigravity"`
+	AntigravityModels []string             `json:"antigravity_models,omitempty"`
+	Timezone          string               `json:"timezone"`
+	Schedules         []scheduledRun       `json:"schedules"`
+	LastRun           *time.Time           `json:"last_run,omitempty"`
+	LastSource        string               `json:"last_source,omitempty"`
+	LastResults       []warmResult         `json:"last_results"`
+	LogCount          int                  `json:"log_count"`
+	StateError        string               `json:"state_error,omitempty"`
+	Configuration     pluginConfig         `json:"configuration"`
 }
 
 type authListResponse struct {
 	Files []pluginapi.HostAuthFileEntry `json:"files"`
+}
+
+type authModelsResponse struct {
+	Credentials []struct {
+		ID        string   `json:"id"`
+		AuthIndex string   `json:"auth_index"`
+		Provider  string   `json:"provider"`
+		Models    []string `json:"models"`
+	} `json:"credentials"`
+}
+
+type hostAuthDocument struct {
+	AuthIndex string          `json:"auth_index"`
+	Name      string          `json:"name,omitempty"`
+	Path      string          `json:"path,omitempty"`
+	JSON      json.RawMessage `json:"json"`
+}
+
+type hostHTTPRequest struct {
+	AuthIndex string      `json:"auth_index,omitempty"`
+	Method    string      `json:"Method"`
+	URL       string      `json:"URL"`
+	Headers   http.Header `json:"Headers,omitempty"`
+	Body      []byte      `json:"Body,omitempty"`
+}
+
+type hostHTTPResponse struct {
+	StatusCode int
+	Headers    http.Header
+	Body       []byte
+}
+
+func (r *hostHTTPResponse) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		StatusCode      *int        `json:"StatusCode"`
+		StatusCodeSnake *int        `json:"status_code"`
+		Headers         http.Header `json:"Headers"`
+		HeadersLower    http.Header `json:"headers"`
+		Body            *string     `json:"Body"`
+		BodyLower       *string     `json:"body"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if raw.StatusCode != nil {
+		r.StatusCode = *raw.StatusCode
+	} else if raw.StatusCodeSnake != nil {
+		r.StatusCode = *raw.StatusCodeSnake
+	}
+	if raw.Headers != nil {
+		r.Headers = raw.Headers
+	} else {
+		r.Headers = raw.HeadersLower
+	}
+	body, err := decodeOptionalBase64Body(raw.Body, raw.BodyLower)
+	if err != nil {
+		return err
+	}
+	r.Body = body
+	return nil
+}
+
+func decodeOptionalBase64Body(primary, fallback *string) ([]byte, error) {
+	selected := primary
+	allowPlain := false
+	if selected == nil {
+		selected = fallback
+		allowPlain = true
+	}
+	if selected == nil || *selected == "" {
+		return nil, nil
+	}
+	decoded, err := base64.StdEncoding.DecodeString(*selected)
+	if err != nil {
+		if allowPlain {
+			return []byte(*selected), nil
+		}
+		return nil, fmt.Errorf("decode host HTTP body: %w", err)
+	}
+	return decoded, nil
 }
 
 type selectedAuth struct {
@@ -205,6 +295,8 @@ type managementResource struct {
 
 type authListFunc func() ([]pluginapi.HostAuthFileEntry, error)
 type warmExecFunc func(providerCfg providerWarmupConfig, provider string, auth pluginapi.HostAuthFileEntry) warmResult
+type hostHTTPDoFunc func(req hostHTTPRequest) (hostHTTPResponse, error)
+type authMaterialFunc func(auth pluginapi.HostAuthFileEntry) (accessToken string, projectID string, err error)
 
 type warmer struct {
 	mu          sync.RWMutex
@@ -221,16 +313,23 @@ type warmer struct {
 	stateError  string
 	stateLocked bool
 
-	fetchAuths  authListFunc
-	executeWarm warmExecFunc
+	fetchAuths       authListFunc
+	executeWarm      warmExecFunc
+	fetchAGMaterial  authMaterialFunc
+	doHostHTTP       hostHTTPDoFunc
+	fallbackModelRun warmExecFunc
 }
 
 func newWarmer() *warmer {
-	return &warmer{
-		config:      defaultPluginConfig(),
-		fetchAuths:  fetchHostAuthFiles,
-		executeWarm: warmOneCredential,
+	w := &warmer{
+		config:           defaultPluginConfig(),
+		fetchAuths:       fetchHostAuthFiles,
+		fetchAGMaterial:  fetchAntigravityMaterial,
+		doHostHTTP:       performHostHTTPDo,
+		fallbackModelRun: warmViaHostModelExecute,
 	}
+	w.executeWarm = w.warmOneCredential
+	return w
 }
 
 func defaultPluginConfig() pluginConfig {
@@ -576,7 +675,7 @@ func (w *warmer) Run(source string, targetProvider string) ([]warmResult, error)
 	}
 	execFn := w.executeWarm
 	if execFn == nil {
-		execFn = warmOneCredential
+		execFn = w.warmOneCredential
 	}
 	w.mu.Unlock()
 
@@ -694,6 +793,38 @@ func fetchHostAuthFiles() ([]pluginapi.HostAuthFileEntry, error) {
 	return response.Files, nil
 }
 
+func fetchAntigravityModels() []string {
+	raw, errCall := callHost(methodHostAuthModels, map[string]any{})
+	if errCall != nil || len(raw) == 0 {
+		return nil
+	}
+	var response authModelsResponse
+	if errUnmarshal := json.Unmarshal(raw, &response); errUnmarshal != nil {
+		return nil
+	}
+	set := make(map[string]struct{})
+	for _, entry := range response.Credentials {
+		if canonical, ok := canonicalWarmupProvider(entry.Provider); !ok || canonical != providerAntigravity {
+			continue
+		}
+		for _, m := range entry.Models {
+			trimmed := strings.TrimSpace(m)
+			if trimmed != "" {
+				set[trimmed] = struct{}{}
+			}
+		}
+	}
+	if len(set) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(set))
+	for m := range set {
+		out = append(out, m)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func canonicalWarmupProvider(provider string) (string, bool) {
 	switch strings.ToLower(strings.TrimSpace(provider)) {
 	case providerCodex:
@@ -750,7 +881,298 @@ func selectProviderAuths(files []pluginapi.HostAuthFileEntry, targetProviders []
 	return auths, selection
 }
 
-func warmOneCredential(providerCfg providerWarmupConfig, provider string, auth pluginapi.HostAuthFileEntry) warmResult {
+func (w *warmer) warmOneCredential(providerCfg providerWarmupConfig, provider string, auth pluginapi.HostAuthFileEntry) warmResult {
+	if provider == providerAntigravity {
+		return w.warmAntigravityCredential(providerCfg, auth)
+	}
+	if w.fallbackModelRun != nil {
+		return w.fallbackModelRun(providerCfg, provider, auth)
+	}
+	return warmViaHostModelExecute(providerCfg, provider, auth)
+}
+
+func (w *warmer) warmAntigravityCredential(providerCfg providerWarmupConfig, auth pluginapi.HostAuthFileEntry) warmResult {
+	result := warmResult{
+		Provider: providerAntigravity,
+		AuthID:   auth.ID,
+		Label:    auth.Label,
+		Model:    providerCfg.Model,
+	}
+	fetchMaterial := w.fetchAGMaterial
+	if fetchMaterial == nil {
+		fetchMaterial = fetchAntigravityMaterial
+	}
+	doHTTP := w.doHostHTTP
+	if doHTTP == nil {
+		doHTTP = performHostHTTPDo
+	}
+	modelFallback := w.fallbackModelRun
+	if modelFallback == nil {
+		modelFallback = warmViaHostModelExecute
+	}
+
+	accessToken, projectID, errMaterial := fetchMaterial(auth)
+	if errMaterial != nil || strings.TrimSpace(accessToken) == "" {
+		// Fall back to host.model.execute when raw token material is unavailable.
+		fb := modelFallback(providerCfg, providerAntigravity, auth)
+		if !fb.Success && errMaterial != nil {
+			fb.Error = fmt.Sprintf("auth material: %v; fallback: %s", errMaterial, fb.Error)
+		}
+		return fb
+	}
+
+	bodyBytes, errBody := buildAntigravityGenerateBody(projectID, providerCfg.Model, providerCfg.Prompt)
+	if errBody != nil {
+		result.Error = errBody.Error()
+		return result
+	}
+
+	authIndex := firstNonEmptyString(auth.AuthIndex, auth.ID, auth.Name)
+	resp, errDo := doHTTP(hostHTTPRequest{
+		AuthIndex: authIndex,
+		Method:    http.MethodPost,
+		URL:       antigravityGenerateDailyURL,
+		Headers:   antigravityRequestHeaders(accessToken, antigravityWarmupUserAgent),
+		Body:      bodyBytes,
+	})
+	if errDo == nil && resp.StatusCode == http.StatusForbidden {
+		legacyResp, legacyErr := doHTTP(hostHTTPRequest{
+			AuthIndex: authIndex,
+			Method:    http.MethodPost,
+			URL:       antigravityGenerateDailyURL,
+			Headers:   antigravityRequestHeaders(accessToken, antigravityLegacyHubUserAgent),
+			Body:      bodyBytes,
+		})
+		if legacyErr == nil {
+			resp = legacyResp
+		}
+	}
+	if errDo != nil {
+		result.Error = errDo.Error()
+		return result
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		// Stored access_token may be expired; let CPA executor attempt an OAuth refresh + call.
+		fb := modelFallback(providerCfg, providerAntigravity, auth)
+		if fb.Success {
+			return fb
+		}
+		result.StatusCode = resp.StatusCode
+		result.Error = fmt.Sprintf("HTTP 401 (%s); fallback: %s", summarizeUpstreamBody(resp.Body), fb.Error)
+		return result
+	}
+
+	result.StatusCode = resp.StatusCode
+	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+		if inBandMsg := extractInBandJSONError(resp.Body); inBandMsg != "" {
+			result.Error = "upstream in-band error: " + inBandMsg
+			return result
+		}
+		result.Success = true
+		return result
+	}
+	summary := summarizeUpstreamBody(resp.Body)
+	if summary != "" {
+		result.Error = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, summary)
+	} else {
+		result.Error = fmt.Sprintf("HTTP %d", resp.StatusCode)
+	}
+	return result
+}
+
+func buildAntigravityGenerateBody(projectID, model, prompt string) ([]byte, error) {
+	envelope := struct {
+		Project     string `json:"project,omitempty"`
+		Model       string `json:"model"`
+		UserAgent   string `json:"userAgent,omitempty"`
+		RequestType string `json:"requestType,omitempty"`
+		RequestID   string `json:"requestId,omitempty"`
+		Request     struct {
+			Contents []struct {
+				Role  string `json:"role"`
+				Parts []struct {
+					Text string `json:"text"`
+				} `json:"parts"`
+			} `json:"contents"`
+			GenerationConfig struct {
+				Temperature float64 `json:"temperature,omitempty"`
+			} `json:"generationConfig"`
+			SessionID string `json:"sessionId,omitempty"`
+		} `json:"request"`
+	}{
+		Project:     strings.TrimSpace(projectID),
+		Model:       strings.TrimSpace(model),
+		UserAgent:   antigravityEnvelopeUserAgent,
+		RequestType: "agent",
+		RequestID:   randomAntigravityRequestID(),
+	}
+	envelope.Request.SessionID = randomAntigravitySessionID()
+	envelope.Request.GenerationConfig.Temperature = 0.7
+	envelope.Request.Contents = []struct {
+		Role  string `json:"role"`
+		Parts []struct {
+			Text string `json:"text"`
+		} `json:"parts"`
+	}{{
+		Role: "user",
+		Parts: []struct {
+			Text string `json:"text"`
+		}{{Text: prompt}},
+	}}
+	return json.Marshal(envelope)
+}
+
+func antigravityRequestHeaders(accessToken, userAgent string) http.Header {
+	return http.Header{
+		"Accept":        []string{"application/json"},
+		"Authorization": []string{"Bearer " + strings.TrimSpace(accessToken)},
+		"Content-Type":  []string{"application/json"},
+		"User-Agent":    []string{userAgent},
+	}
+}
+
+func randomAntigravityRequestID() string {
+	var buf [16]byte
+	_, _ = rand.Read(buf[:])
+	return fmt.Sprintf("agent-%x", buf)
+}
+
+func randomAntigravitySessionID() string {
+	var buf [8]byte
+	_, _ = rand.Read(buf[:])
+	val := binary.BigEndian.Uint64(buf[:]) & 0x7FFFFFFFFFFFFFFF
+	return "-" + strconv.FormatUint(val, 10)
+}
+
+func fetchAntigravityMaterial(auth pluginapi.HostAuthFileEntry) (string, string, error) {
+	authIndex := firstNonEmptyString(auth.AuthIndex, auth.ID, auth.Name)
+	if authIndex == "" {
+		return "", "", errors.New("missing auth_index")
+	}
+	raw, errCall := callHost(pluginabi.MethodHostAuthGet, map[string]string{"auth_index": authIndex})
+	if errCall != nil {
+		return "", "", errCall
+	}
+	var doc hostAuthDocument
+	if errUnmarshal := json.Unmarshal(raw, &doc); errUnmarshal != nil {
+		return "", "", fmt.Errorf("decode host.auth.get: %w", errUnmarshal)
+	}
+	rawJSON := doc.JSON
+	if len(rawJSON) == 0 && strings.TrimSpace(doc.Path) != "" {
+		fileBytes, errRead := os.ReadFile(doc.Path)
+		if errRead != nil {
+			return "", "", fmt.Errorf("read auth file: %w", errRead)
+		}
+		rawJSON = fileBytes
+	}
+	token, projectID := extractAntigravityAuthFields(rawJSON)
+	if token == "" {
+		return "", projectID, errors.New("access_token not found in auth document")
+	}
+	return token, projectID, nil
+}
+
+func extractAntigravityAuthFields(raw json.RawMessage) (string, string) {
+	var fields struct {
+		AccessToken    string `json:"access_token"`
+		Token          string `json:"token"`
+		ProjectID      string `json:"project_id"`
+		QuotaProjectID string `json:"quota_project_id"`
+		Project        string `json:"project"`
+		Metadata       struct {
+			AccessToken    string `json:"access_token"`
+			Token          string `json:"token"`
+			ProjectID      string `json:"project_id"`
+			QuotaProjectID string `json:"quota_project_id"`
+			Project        string `json:"project"`
+		} `json:"metadata"`
+	}
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return "", ""
+	}
+	accessToken := firstNonEmptyString(
+		fields.AccessToken,
+		fields.Token,
+		fields.Metadata.AccessToken,
+		fields.Metadata.Token,
+	)
+	projectID := firstNonEmptyString(
+		fields.ProjectID,
+		fields.QuotaProjectID,
+		fields.Project,
+		fields.Metadata.ProjectID,
+		fields.Metadata.QuotaProjectID,
+		fields.Metadata.Project,
+	)
+	return accessToken, projectID
+}
+
+func performHostHTTPDo(req hostHTTPRequest) (hostHTTPResponse, error) {
+	raw, errCall := callHost(pluginabi.MethodHostHTTPDo, req)
+	if errCall != nil {
+		return hostHTTPResponse{}, errCall
+	}
+	var resp hostHTTPResponse
+	if errUnmarshal := json.Unmarshal(raw, &resp); errUnmarshal != nil {
+		return hostHTTPResponse{}, fmt.Errorf("decode host.http.do response: %w", errUnmarshal)
+	}
+	return resp, nil
+}
+
+func extractInBandJSONError(body []byte) string {
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" || trimmed[0] != '{' {
+		return ""
+	}
+	var payload struct {
+		Error *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+			Status  string `json:"status"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil || payload.Error == nil {
+		return ""
+	}
+	msg := strings.TrimSpace(payload.Error.Message)
+	if msg == "" {
+		msg = strings.TrimSpace(payload.Error.Status)
+	}
+	if msg == "" && payload.Error.Code != 0 {
+		msg = fmt.Sprintf("code %d", payload.Error.Code)
+	}
+	return msg
+}
+
+func summarizeUpstreamBody(body []byte) string {
+	if msg := extractInBandJSONError(body); msg != "" {
+		return truncateString(msg, 300)
+	}
+	collapsed := strings.Join(strings.Fields(string(body)), " ")
+	return truncateString(collapsed, 300)
+}
+
+func truncateString(s string, maxRunes int) string {
+	if maxRunes <= 0 || len(s) == 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	return string(runes[:maxRunes]) + "..."
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, v := range values {
+		if trimmed := strings.TrimSpace(v); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func warmViaHostModelExecute(providerCfg providerWarmupConfig, provider string, auth pluginapi.HostAuthFileEntry) warmResult {
 	result := warmResult{
 		Provider: provider,
 		AuthID:   auth.ID,
@@ -806,7 +1228,6 @@ func warmOneCredential(providerCfg providerWarmupConfig, provider string, auth p
 
 func (w *warmer) Status() warmerStatus {
 	w.mu.RLock()
-	defer w.mu.RUnlock()
 	cfg := cloneConfig(w.config)
 	next := nextRuns(cfg, time.Now())
 	var lastRun *time.Time
@@ -814,7 +1235,7 @@ func (w *warmer) Status() warmerStatus {
 		value := w.lastRun
 		lastRun = &value
 	}
-	return warmerStatus{
+	status := warmerStatus{
 		Plugin:        pluginID,
 		Version:       pluginVersion,
 		Running:       w.running,
@@ -829,6 +1250,10 @@ func (w *warmer) Status() warmerStatus {
 		StateError:    w.stateError,
 		Configuration: cfg,
 	}
+	w.mu.RUnlock()
+
+	status.AntigravityModels = fetchAntigravityModels()
+	return status
 }
 
 func nextRuns(cfg pluginConfig, now time.Time) []scheduledRun {
@@ -1173,7 +1598,6 @@ func decodeManagementBody(primary, fallback json.RawMessage) ([]byte, error) {
 		}
 		decoded, errDec := base64.StdEncoding.DecodeString(b64)
 		if errDec != nil {
-			// Fallback to raw string bytes if host passed plain JSON-encoded text.
 			return []byte(b64), nil
 		}
 		return decoded, nil

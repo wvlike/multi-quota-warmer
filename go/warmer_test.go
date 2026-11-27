@@ -108,6 +108,50 @@ func TestSelectProviderAuthsAndMultiProviderRun(t *testing.T) {
 	}
 }
 
+func TestWarmAntigravityDirectHTTPDoAndFallback(t *testing.T) {
+	w := newWarmer()
+	auth := pluginapi.HostAuthFileEntry{ID: "ag-1", AuthIndex: "idx-1", Provider: "antigravity", Label: "ag@example.com"}
+	cfg := providerWarmupConfig{Enabled: true, Model: "gemini-3.8-flash-tiered", Prompt: "hello"}
+
+	w.fetchAGMaterial = func(entry pluginapi.HostAuthFileEntry) (string, string, error) {
+		return "tok-123", "proj-456", nil
+	}
+	var gotURL string
+	var gotUA []string
+	w.doHostHTTP = func(req hostHTTPRequest) (hostHTTPResponse, error) {
+		gotURL = req.URL
+		gotUA = append(gotUA, req.Headers.Get("User-Agent"))
+		if len(gotUA) == 1 {
+			return hostHTTPResponse{StatusCode: http.StatusForbidden, Body: []byte(`{"error":{"message":"forbidden"}}`)}, nil
+		}
+		return hostHTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"response":{}}`)}, nil
+	}
+
+	res := w.warmAntigravityCredential(cfg, auth)
+	if !res.Success || res.StatusCode != http.StatusOK {
+		t.Fatalf("expected legacy UA retry success, got %+v", res)
+	}
+	if gotURL != antigravityGenerateDailyURL || len(gotUA) != 2 || gotUA[1] != antigravityLegacyHubUserAgent {
+		t.Fatalf("unexpected direct http calls: url=%s uas=%v", gotURL, gotUA)
+	}
+
+	w.doHostHTTP = func(req hostHTTPRequest) (hostHTTPResponse, error) {
+		return hostHTTPResponse{StatusCode: http.StatusNotFound, Body: []byte(`{"error":{"message":"Requested entity was not found"}}`)}, nil
+	}
+	resErr := w.warmAntigravityCredential(cfg, auth)
+	if resErr.Success || resErr.StatusCode != http.StatusNotFound || !strings.Contains(resErr.Error, "Requested entity was not found") {
+		t.Fatalf("expected detailed 404 error, got %+v", resErr)
+	}
+}
+
+func TestExtractAntigravityAuthFields(t *testing.T) {
+	raw := json.RawMessage(`{"metadata":{"access_token":"tok-abc","quota_project_id":"proj-xyz"}}`)
+	tok, proj := extractAntigravityAuthFields(raw)
+	if tok != "tok-abc" || proj != "proj-xyz" {
+		t.Fatalf("unexpected extracted fields: tok=%q proj=%q", tok, proj)
+	}
+}
+
 func TestLogsPaginationAndFilter(t *testing.T) {
 	w := newWarmer()
 	for i := 1; i <= 25; i++ {

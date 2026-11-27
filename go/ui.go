@@ -101,7 +101,7 @@ const statusPageHTML = `<!doctype html>
           <h3 style="margin:0">Antigravity 渠道</h3>
           <label class="muted row-center"><input id="ag-enabled" type="checkbox"> 启用定时预热</label>
         </div>
-        <div class="field"><label for="ag-model">模型</label><input id="ag-model" type="text" placeholder="gemini-3-flash"></div>
+        <div class="field"><label for="ag-model">模型</label><input id="ag-model" type="text" list="ag-model-options" placeholder="gemini-3-flash"><datalist id="ag-model-options"></datalist></div>
         <div class="field" style="margin-top:10px"><label for="ag-prompt">预热消息</label><textarea id="ag-prompt"></textarea></div>
         <p class="hint" style="margin:8px 0 0">提示：Gemini 模型通常需要较长输出（建议要求 ≥600 tokens）才能可靠激活 5h 窗口；Claude 模型（如 claude-sonnet-5-5-high）短消息即可。</p>
       </div>
@@ -172,6 +172,7 @@ const statusPageHTML = `<!doctype html>
     codexPrompt: document.querySelector("#codex-prompt"),
     agEnabled: document.querySelector("#ag-enabled"),
     agModel: document.querySelector("#ag-model"),
+    agModelOptions: document.querySelector("#ag-model-options"),
     agPrompt: document.querySelector("#ag-prompt"),
     schedules: document.querySelector("#schedules"),
     logs: document.querySelector("#logs"),
@@ -258,6 +259,14 @@ const statusPageHTML = `<!doctype html>
 
   function renderStatus(status) {
     elements.summary.replaceChildren();
+    if (Array.isArray(status.antigravity_models) && elements.agModelOptions) {
+      elements.agModelOptions.replaceChildren();
+      status.antigravity_models.forEach(m => {
+        const opt = document.createElement("option");
+        opt.value = m;
+        elements.agModelOptions.append(opt);
+      });
+    }
     const codexCfg = status.codex || {};
     const agCfg = status.antigravity || {};
     const fields = [
