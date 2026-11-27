@@ -57,7 +57,7 @@ func writeRunState(path string, state runState) error {
 	if errMkdir := os.MkdirAll(dir, 0o700); errMkdir != nil {
 		return fmt.Errorf("create warm-up state directory: %w", errMkdir)
 	}
-	file, errCreate := os.CreateTemp(dir, ".codex-5h-quota-warmer-*.tmp")
+	file, errCreate := os.CreateTemp(dir, ".multi-quota-warmer-*.tmp")
 	if errCreate != nil {
 		return fmt.Errorf("create temporary warm-up state: %w", errCreate)
 	}
@@ -125,7 +125,7 @@ func (w *warmer) persistLocked() error {
 func (w *warmer) logStateFailure(message string) {
 	_, _ = callHost(pluginabi.MethodHostLog, map[string]any{
 		"level":   "error",
-		"message": "Codex warm-up state persistence failed",
+		"message": "Multi-provider warm-up state persistence failed",
 		"fields":  map[string]any{"plugin_id": pluginID, "error": message},
 	})
 }

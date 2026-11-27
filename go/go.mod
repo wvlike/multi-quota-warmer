@@ -1,4 +1,4 @@
-module github.com/Windyskr/codex-5h-quota-warmer/go
+module github.com/wvlike/multi-quota-warmer/go
 
 go 1.26.0
 

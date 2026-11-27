@@ -1,13 +1,16 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,22 +21,57 @@ import (
 )
 
 const (
-	pluginID       = "codex-5h-quota-warmer"
-	pluginName     = "Codex Five-Hour Quota Warmer"
-	pluginVersion  = "0.2.0"
+	pluginID       = "multi-quota-warmer"
+	pluginName     = "Multi-Provider Five-Hour Quota Warmer"
+	pluginVersion  = "0.3.0"
 	maxLogsDefault = 200
+
+	providerCodex       = "codex"
+	providerAntigravity = "antigravity"
+
+	defaultCodexModel         = "gpt-5.6-luna"
+	defaultCodexPrompt        = "Reply with exactly: quota window activated"
+	defaultAntigravityModel   = "gemini-3-flash"
+	defaultAntigravityPrompt  = "Explain how HTTP/2 stream multiplexing works in detail with concrete examples. Write at least 600 tokens across several paragraphs without summarizing early."
+	defaultTimezone           = "Asia/Singapore"
+	defaultLogPageSize        = 20
+	maxLogPageSize            = 200
 )
 
 var globalWarmer = newWarmer()
 
+type providerWarmupConfig struct {
+	Enabled bool   `yaml:"enabled" json:"enabled"`
+	Model   string `yaml:"model" json:"model"`
+	Prompt  string `yaml:"prompt" json:"prompt"`
+}
+
 type pluginConfig struct {
-	Enabled       bool       `yaml:"enabled"`
-	Model         string     `yaml:"model"`
-	Prompt        string     `yaml:"prompt"`
-	Timezone      string     `yaml:"timezone"`
-	Schedules     []schedule `yaml:"schedules"`
-	MaxLogEntries int        `yaml:"max_log_entries"`
-	StateFile     string     `yaml:"state_file"`
+	Enabled       bool                 `yaml:"enabled" json:"enabled"`
+	Codex         providerWarmupConfig `yaml:"codex" json:"codex"`
+	Antigravity   providerWarmupConfig `yaml:"antigravity" json:"antigravity"`
+	Timezone      string               `yaml:"timezone" json:"timezone"`
+	Schedules     []schedule           `yaml:"schedules" json:"schedules"`
+	MaxLogEntries int                  `yaml:"max_log_entries" json:"max_log_entries"`
+	StateFile     string               `yaml:"state_file" json:"state_file"`
+}
+
+type rawPluginConfig struct {
+	Enabled       bool                  `yaml:"enabled"`
+	Codex         *rawProviderConfig    `yaml:"codex"`
+	Antigravity   *rawProviderConfig    `yaml:"antigravity"`
+	Model         string                `yaml:"model"`
+	Prompt        string                `yaml:"prompt"`
+	Timezone      string                `yaml:"timezone"`
+	Schedules     []schedule            `yaml:"schedules"`
+	MaxLogEntries int                   `yaml:"max_log_entries"`
+	StateFile     string                `yaml:"state_file"`
+}
+
+type rawProviderConfig struct {
+	Enabled *bool  `yaml:"enabled"`
+	Model   string `yaml:"model"`
+	Prompt  string `yaml:"prompt"`
 }
 
 type schedule struct {
@@ -49,6 +87,7 @@ type scheduledRun struct {
 }
 
 type warmResult struct {
+	Provider   string `json:"provider,omitempty"`
 	AuthID     string `json:"auth_id"`
 	Label      string `json:"label,omitempty"`
 	Model      string `json:"model"`
@@ -65,32 +104,47 @@ type logEntry struct {
 	Fields  map[string]any `json:"fields,omitempty"`
 }
 
+type logPage struct {
+	Logs       []logEntry `json:"logs"`
+	Total      int        `json:"total"`
+	Page       int        `json:"page"`
+	PageSize   int        `json:"page_size"`
+	TotalPages int        `json:"total_pages"`
+}
+
 type warmerStatus struct {
-	Plugin        string         `json:"plugin"`
-	Version       string         `json:"version"`
-	Running       bool           `json:"running"`
-	Model         string         `json:"model"`
-	Timezone      string         `json:"timezone"`
-	Schedules     []scheduledRun `json:"schedules"`
-	LastRun       *time.Time     `json:"last_run,omitempty"`
-	LastSource    string         `json:"last_source,omitempty"`
-	LastResults   []warmResult   `json:"last_results"`
-	LogCount      int            `json:"log_count"`
-	StateError    string         `json:"state_error,omitempty"`
-	Configuration pluginConfig   `json:"configuration"`
+	Plugin        string               `json:"plugin"`
+	Version       string               `json:"version"`
+	Running       bool                 `json:"running"`
+	Codex         providerWarmupConfig `json:"codex"`
+	Antigravity   providerWarmupConfig `json:"antigravity"`
+	Timezone      string               `json:"timezone"`
+	Schedules     []scheduledRun       `json:"schedules"`
+	LastRun       *time.Time           `json:"last_run,omitempty"`
+	LastSource    string               `json:"last_source,omitempty"`
+	LastResults   []warmResult         `json:"last_results"`
+	LogCount      int                  `json:"log_count"`
+	StateError    string               `json:"state_error,omitempty"`
+	Configuration pluginConfig         `json:"configuration"`
 }
 
 type authListResponse struct {
 	Files []pluginapi.HostAuthFileEntry `json:"files"`
 }
 
+type selectedAuth struct {
+	Provider string
+	Entry    pluginapi.HostAuthFileEntry
+}
+
 type authSelection struct {
-	Total       int
-	Codex       int
-	Disabled    int
-	Unavailable int
-	Inactive    int
-	MissingID   int
+	Total            int
+	CodexTotal       int
+	AntigravityTotal int
+	Disabled         int
+	Unavailable      int
+	Inactive         int
+	MissingID        int
 }
 
 type lifecycleRequest struct {
@@ -98,9 +152,23 @@ type lifecycleRequest struct {
 }
 
 type managementRequest struct {
-	Method string          `json:"Method"`
-	Path   string          `json:"Path"`
-	Body   json.RawMessage `json:"Body"`
+	Method  string
+	Path    string
+	Headers http.Header
+	Query   url.Values
+	Body    []byte
+}
+
+type managementRequestWire struct {
+	Method      string          `json:"Method"`
+	MethodLower string          `json:"method"`
+	Path        string          `json:"Path"`
+	PathLower   string          `json:"path"`
+	Headers     http.Header     `json:"Headers"`
+	QueryRaw    json.RawMessage `json:"Query"`
+	QueryLower  json.RawMessage `json:"query"`
+	BodyRaw     json.RawMessage `json:"Body"`
+	BodyLower   json.RawMessage `json:"body"`
 }
 
 type managementResponse struct {
@@ -135,6 +203,9 @@ type managementResource struct {
 	Description string `json:"Description"`
 }
 
+type authListFunc func() ([]pluginapi.HostAuthFileEntry, error)
+type warmExecFunc func(providerCfg providerWarmupConfig, provider string, auth pluginapi.HostAuthFileEntry) warmResult
+
 type warmer struct {
 	mu          sync.RWMutex
 	config      pluginConfig
@@ -149,17 +220,32 @@ type warmer struct {
 	stateFile   string
 	stateError  string
 	stateLocked bool
+
+	fetchAuths  authListFunc
+	executeWarm warmExecFunc
 }
 
 func newWarmer() *warmer {
-	return &warmer{config: defaultPluginConfig()}
+	return &warmer{
+		config:      defaultPluginConfig(),
+		fetchAuths:  fetchHostAuthFiles,
+		executeWarm: warmOneCredential,
+	}
 }
 
 func defaultPluginConfig() pluginConfig {
 	return pluginConfig{
-		Model:         "gpt-5.6-luna",
-		Prompt:        "Reply with exactly: quota window activated",
-		Timezone:      "Asia/Singapore",
+		Codex: providerWarmupConfig{
+			Enabled: true,
+			Model:   defaultCodexModel,
+			Prompt:  defaultCodexPrompt,
+		},
+		Antigravity: providerWarmupConfig{
+			Enabled: true,
+			Model:   defaultAntigravityModel,
+			Prompt:  defaultAntigravityPrompt,
+		},
+		Timezone:      defaultTimezone,
 		MaxLogEntries: maxLogsDefault,
 		StateFile:     defaultStateFile(),
 	}
@@ -170,20 +256,48 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	if len(raw) == 0 {
 		return cfg, nil
 	}
-	if errUnmarshal := yaml.Unmarshal(raw, &cfg); errUnmarshal != nil {
+	var decoded rawPluginConfig
+	if errUnmarshal := yaml.Unmarshal(raw, &decoded); errUnmarshal != nil {
 		return pluginConfig{}, fmt.Errorf("decode plugin configuration: %w", errUnmarshal)
 	}
-	cfg.Model = strings.TrimSpace(cfg.Model)
-	if cfg.Model == "" {
-		return pluginConfig{}, fmt.Errorf("model is required")
+	cfg.Enabled = decoded.Enabled
+	cfg.Schedules = decoded.Schedules
+	cfg.MaxLogEntries = decoded.MaxLogEntries
+	cfg.StateFile = decoded.StateFile
+
+	if decoded.Codex != nil {
+		if decoded.Codex.Enabled != nil {
+			cfg.Codex.Enabled = *decoded.Codex.Enabled
+		}
+		cfg.Codex.Model = strings.TrimSpace(decoded.Codex.Model)
+		cfg.Codex.Prompt = strings.TrimSpace(decoded.Codex.Prompt)
 	}
-	cfg.Prompt = strings.TrimSpace(cfg.Prompt)
-	if cfg.Prompt == "" {
-		return pluginConfig{}, fmt.Errorf("prompt is required")
+	if decoded.Antigravity != nil {
+		if decoded.Antigravity.Enabled != nil {
+			cfg.Antigravity.Enabled = *decoded.Antigravity.Enabled
+		}
+		cfg.Antigravity.Model = strings.TrimSpace(decoded.Antigravity.Model)
+		cfg.Antigravity.Prompt = strings.TrimSpace(decoded.Antigravity.Prompt)
 	}
-	cfg.Timezone = strings.TrimSpace(cfg.Timezone)
+
+	// Backward compatibility: migrate legacy top-level model/prompt into codex when omitted.
+	if legacyModel := strings.TrimSpace(decoded.Model); legacyModel != "" && (decoded.Codex == nil || cfg.Codex.Model == "") {
+		cfg.Codex.Model = legacyModel
+	}
+	if legacyPrompt := strings.TrimSpace(decoded.Prompt); legacyPrompt != "" && (decoded.Codex == nil || cfg.Codex.Prompt == "") {
+		cfg.Codex.Prompt = legacyPrompt
+	}
+
+	if errCodex := normalizeProviderConfig(&cfg.Codex, providerCodex, defaultCodexModel, defaultCodexPrompt, decoded.Codex != nil); errCodex != nil {
+		return pluginConfig{}, errCodex
+	}
+	if errAG := normalizeProviderConfig(&cfg.Antigravity, providerAntigravity, defaultAntigravityModel, defaultAntigravityPrompt, decoded.Antigravity != nil); errAG != nil {
+		return pluginConfig{}, errAG
+	}
+
+	cfg.Timezone = strings.TrimSpace(decoded.Timezone)
 	if cfg.Timezone == "" {
-		cfg.Timezone = "Asia/Singapore"
+		cfg.Timezone = defaultTimezone
 	}
 	if _, errLocation := time.LoadLocation(cfg.Timezone); errLocation != nil {
 		return pluginConfig{}, fmt.Errorf("timezone %q is invalid: %w", cfg.Timezone, errLocation)
@@ -232,6 +346,36 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	return cfg, nil
 }
 
+func normalizeProviderConfig(cfg *providerWarmupConfig, name, fallbackModel, fallbackPrompt string, explicitlyPresent bool) error {
+	cfg.Model = strings.TrimSpace(cfg.Model)
+	cfg.Prompt = strings.TrimSpace(cfg.Prompt)
+	if !explicitlyPresent {
+		if cfg.Model == "" {
+			cfg.Model = fallbackModel
+		}
+		if cfg.Prompt == "" {
+			cfg.Prompt = fallbackPrompt
+		}
+		return nil
+	}
+	if cfg.Enabled {
+		if cfg.Model == "" {
+			return fmt.Errorf("%s.model is required when %s is enabled", name, name)
+		}
+		if cfg.Prompt == "" {
+			return fmt.Errorf("%s.prompt is required when %s is enabled", name, name)
+		}
+		return nil
+	}
+	if cfg.Model == "" {
+		cfg.Model = fallbackModel
+	}
+	if cfg.Prompt == "" {
+		cfg.Prompt = fallbackPrompt
+	}
+	return nil
+}
+
 func scheduleEnabled(item schedule) bool {
 	return item.Enabled == nil || *item.Enabled
 }
@@ -274,9 +418,12 @@ func (w *warmer) Configure(cfg pluginConfig) {
 		w.logStateFailure(loadError)
 	}
 	w.recordLog("info", "configuration.updated", "Warm-up configuration updated", map[string]any{
-		"schedule_count": len(cfg.Schedules),
-		"timezone":       cfg.Timezone,
-		"model":          cfg.Model,
+		"schedule_count":      len(cfg.Schedules),
+		"timezone":            cfg.Timezone,
+		"codex_enabled":       cfg.Codex.Enabled,
+		"codex_model":         cfg.Codex.Model,
+		"antigravity_enabled": cfg.Antigravity.Enabled,
+		"antigravity_model":   cfg.Antigravity.Model,
 	})
 	if !cfg.Enabled {
 		return
@@ -321,7 +468,7 @@ func (w *warmer) runScheduleLoop(cfg pluginConfig, stop <-chan struct{}, done ch
 		w.planned = next
 		w.mu.Unlock()
 		if !alreadyPlanned {
-			w.recordLog("info", "schedule.planned", "Next Codex warm-up scheduled", map[string]any{
+			w.recordLog("info", "schedule.planned", "Next quota warm-up scheduled", map[string]any{
 				"schedule_id":  next.ID,
 				"scheduled_at": next.Time.Format(time.RFC3339),
 			})
@@ -338,12 +485,12 @@ func (w *warmer) runScheduleLoop(cfg pluginConfig, stop <-chan struct{}, done ch
 			return
 		case <-timer.C:
 			source := "schedule:" + next.ID
-			w.recordLog("info", "schedule.triggered", "Codex warm-up schedule triggered", map[string]any{
+			w.recordLog("info", "schedule.triggered", "Quota warm-up schedule triggered", map[string]any{
 				"source":       source,
 				"scheduled_at": next.Time.Format(time.RFC3339),
 			})
-			if _, errRun := w.Run(source); errRun != nil {
-				w.recordLog("error", "schedule.failed", "Scheduled Codex warm-up failed", map[string]any{
+			if _, errRun := w.Run(source, "all"); errRun != nil {
+				w.recordLog("error", "schedule.failed", "Scheduled quota warm-up failed", map[string]any{
 					"source": source,
 					"error":  errRun.Error(),
 				})
@@ -380,7 +527,32 @@ func nextScheduledRun(cfg pluginConfig, now time.Time) (scheduledRun, bool) {
 	return next, found
 }
 
-func (w *warmer) Run(source string) ([]warmResult, error) {
+func resolveTargetProviders(cfg pluginConfig, targetProvider string) ([]string, error) {
+	normalized := strings.ToLower(strings.TrimSpace(targetProvider))
+	switch normalized {
+	case "", "all":
+		providers := make([]string, 0, 2)
+		if cfg.Codex.Enabled {
+			providers = append(providers, providerCodex)
+		}
+		if cfg.Antigravity.Enabled {
+			providers = append(providers, providerAntigravity)
+		}
+		return providers, nil
+	case providerCodex:
+		return []string{providerCodex}, nil
+	case providerAntigravity:
+		return []string{providerAntigravity}, nil
+	default:
+		return nil, &hostCallError{
+			code:       "invalid_provider",
+			message:    fmt.Sprintf("unsupported provider %q (must be all, codex, or antigravity)", targetProvider),
+			httpStatus: http.StatusBadRequest,
+		}
+	}
+}
+
+func (w *warmer) Run(source string, targetProvider string) ([]warmResult, error) {
 	w.mu.Lock()
 	if w.running {
 		w.mu.Unlock()
@@ -391,10 +563,27 @@ func (w *warmer) Run(source string) ([]warmResult, error) {
 		w.mu.Unlock()
 		return nil, &hostCallError{code: "plugin_disabled", message: "the plugin is disabled", httpStatus: http.StatusConflict}
 	}
+	providers, errProviders := resolveTargetProviders(cfg, targetProvider)
+	if errProviders != nil {
+		w.mu.Unlock()
+		return nil, errProviders
+	}
 	w.running = true
 	w.lastSource = source
+	fetchFn := w.fetchAuths
+	if fetchFn == nil {
+		fetchFn = fetchHostAuthFiles
+	}
+	execFn := w.executeWarm
+	if execFn == nil {
+		execFn = warmOneCredential
+	}
 	w.mu.Unlock()
-	w.recordLog("info", "warmup.started", "Codex credential warm-up started", map[string]any{"source": source, "model": cfg.Model})
+
+	w.recordLog("info", "warmup.started", "Multi-provider credential warm-up started", map[string]any{
+		"source":    source,
+		"providers": providers,
+	})
 
 	defer func() {
 		w.mu.Lock()
@@ -407,16 +596,34 @@ func (w *warmer) Run(source string) ([]warmResult, error) {
 		}
 	}()
 
-	auths, selection, errAuths := listCodexAuths()
+	if len(providers) == 0 {
+		w.mu.Lock()
+		w.lastResults = []warmResult{}
+		w.mu.Unlock()
+		w.recordLog("warn", "warmup.no_providers_enabled", "No warm-up providers are enabled", map[string]any{"source": source})
+		w.recordLog("warn", "warmup.finished", "Multi-provider credential warm-up finished", map[string]any{
+			"source":           source,
+			"credential_count": 0,
+			"success_count":    0,
+			"failure_count":    0,
+		})
+		return []warmResult{}, nil
+	}
+
+	files, errAuths := fetchFn()
 	if errAuths != nil {
-		w.recordLog("error", "warmup.auth_list_failed", "Unable to list Codex credentials", map[string]any{"source": source, "error": errAuths.Error()})
-		w.recordLog("error", "warmup.finished", "Codex credential warm-up failed", map[string]any{"source": source, "credential_count": 0, "success_count": 0, "failure_count": 0, "error": errAuths.Error()})
+		w.recordLog("error", "warmup.auth_list_failed", "Unable to list credentials", map[string]any{"source": source, "error": errAuths.Error()})
+		w.recordLog("error", "warmup.finished", "Multi-provider credential warm-up failed", map[string]any{"source": source, "credential_count": 0, "success_count": 0, "failure_count": 0, "error": errAuths.Error()})
 		return nil, errAuths
 	}
-	w.recordLog("info", "warmup.selection", "Codex credentials selected for warm-up", map[string]any{
+
+	auths, selection := selectProviderAuths(files, providers)
+	w.recordLog("info", "warmup.selection", "Credentials selected for warm-up", map[string]any{
 		"source":               source,
+		"providers":            providers,
 		"auth_total":           selection.Total,
-		"codex_total":          selection.Codex,
+		"codex_total":          selection.CodexTotal,
+		"antigravity_total":    selection.AntigravityTotal,
 		"selected_count":       len(auths),
 		"skipped_disabled":     selection.Disabled,
 		"reported_unavailable": selection.Unavailable,
@@ -424,23 +631,25 @@ func (w *warmer) Run(source string) ([]warmResult, error) {
 		"skipped_missing_id":   selection.MissingID,
 	})
 	if len(auths) == 0 {
-		w.recordLog("warn", "warmup.no_credentials", "No eligible Codex credentials for warm-up", map[string]any{"source": source})
+		w.recordLog("warn", "warmup.no_credentials", "No eligible credentials for warm-up", map[string]any{"source": source, "providers": providers})
 	}
 	results := make([]warmResult, 0, len(auths))
 	successCount := 0
-	for _, auth := range auths {
-		result := warmOneCredential(cfg, auth)
+	for _, item := range auths {
+		providerCfg := configForProvider(cfg, item.Provider)
+		result := execFn(providerCfg, item.Provider, item.Entry)
 		results = append(results, result)
 		level := "info"
-		message := "Codex credential warm-up completed"
+		message := "Credential warm-up completed"
 		if !result.Success {
 			level = "warn"
-			message = "Codex credential warm-up failed"
+			message = "Credential warm-up failed"
 		} else {
 			successCount++
 		}
 		w.recordLog(level, "warmup.credential", message, map[string]any{
 			"source":      source,
+			"provider":    result.Provider,
 			"auth_id":     result.AuthID,
 			"label":       result.Label,
 			"model":       result.Model,
@@ -455,7 +664,7 @@ func (w *warmer) Run(source string) ([]warmResult, error) {
 	if len(results) == 0 || successCount != len(results) {
 		level = "warn"
 	}
-	w.recordLog(level, "warmup.finished", "Codex credential warm-up finished", map[string]any{
+	w.recordLog(level, "warmup.finished", "Multi-provider credential warm-up finished", map[string]any{
 		"source":           source,
 		"credential_count": len(results),
 		"success_count":    successCount,
@@ -464,22 +673,58 @@ func (w *warmer) Run(source string) ([]warmResult, error) {
 	return results, nil
 }
 
-func listCodexAuths() ([]pluginapi.HostAuthFileEntry, authSelection, error) {
+func configForProvider(cfg pluginConfig, provider string) providerWarmupConfig {
+	switch provider {
+	case providerAntigravity:
+		return cfg.Antigravity
+	default:
+		return cfg.Codex
+	}
+}
+
+func fetchHostAuthFiles() ([]pluginapi.HostAuthFileEntry, error) {
 	raw, errCall := callHost(pluginabi.MethodHostAuthList, map[string]any{})
 	if errCall != nil {
-		return nil, authSelection{}, errCall
+		return nil, errCall
 	}
 	var response authListResponse
 	if errUnmarshal := json.Unmarshal(raw, &response); errUnmarshal != nil {
-		return nil, authSelection{}, fmt.Errorf("decode host.auth.list response: %w", errUnmarshal)
+		return nil, fmt.Errorf("decode host.auth.list response: %w", errUnmarshal)
 	}
-	selection := authSelection{Total: len(response.Files)}
-	auths := make([]pluginapi.HostAuthFileEntry, 0, len(response.Files))
-	for _, auth := range response.Files {
-		if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+	return response.Files, nil
+}
+
+func canonicalWarmupProvider(provider string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case providerCodex:
+		return providerCodex, true
+	case providerAntigravity, "google-antigravity":
+		return providerAntigravity, true
+	default:
+		return "", false
+	}
+}
+
+func selectProviderAuths(files []pluginapi.HostAuthFileEntry, targetProviders []string) ([]selectedAuth, authSelection) {
+	targetSet := make(map[string]struct{}, len(targetProviders))
+	for _, p := range targetProviders {
+		targetSet[p] = struct{}{}
+	}
+	selection := authSelection{Total: len(files)}
+	auths := make([]selectedAuth, 0, len(files))
+	for _, auth := range files {
+		canonical, ok := canonicalWarmupProvider(auth.Provider)
+		if !ok {
 			continue
 		}
-		selection.Codex++
+		if canonical == providerCodex {
+			selection.CodexTotal++
+		} else if canonical == providerAntigravity {
+			selection.AntigravityTotal++
+		}
+		if _, wanted := targetSet[canonical]; !wanted {
+			continue
+		}
 		switch {
 		case auth.Disabled:
 			selection.Disabled++
@@ -494,21 +739,29 @@ func listCodexAuths() ([]pluginapi.HostAuthFileEntry, authSelection, error) {
 		if !strings.EqualFold(strings.TrimSpace(auth.Status), "active") {
 			selection.Inactive++
 		}
-		auths = append(auths, auth)
+		auths = append(auths, selectedAuth{Provider: canonical, Entry: auth})
 	}
 	sort.Slice(auths, func(i, j int) bool {
-		return strings.ToLower(auths[i].ID) < strings.ToLower(auths[j].ID)
+		if auths[i].Provider != auths[j].Provider {
+			return auths[i].Provider < auths[j].Provider
+		}
+		return strings.ToLower(auths[i].Entry.ID) < strings.ToLower(auths[j].Entry.ID)
 	})
-	return auths, selection, nil
+	return auths, selection
 }
 
-func warmOneCredential(cfg pluginConfig, auth pluginapi.HostAuthFileEntry) warmResult {
-	result := warmResult{AuthID: auth.ID, Label: auth.Label, Model: cfg.Model}
+func warmOneCredential(providerCfg providerWarmupConfig, provider string, auth pluginapi.HostAuthFileEntry) warmResult {
+	result := warmResult{
+		Provider: provider,
+		AuthID:   auth.ID,
+		Label:    auth.Label,
+		Model:    providerCfg.Model,
+	}
 	body, errBody := json.Marshal(map[string]any{
-		"model": cfg.Model,
+		"model": providerCfg.Model,
 		"messages": []map[string]string{{
 			"role":    "user",
-			"content": cfg.Prompt,
+			"content": providerCfg.Prompt,
 		}},
 		"stream": false,
 	})
@@ -516,14 +769,18 @@ func warmOneCredential(cfg pluginConfig, auth pluginapi.HostAuthFileEntry) warmR
 		result.Error = errBody.Error()
 		return result
 	}
+	forcedProvider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	if forcedProvider == "" {
+		forcedProvider = provider
+	}
 	raw, errCall := callHost(pluginabi.MethodHostModelExecute, pluginapi.HostModelExecutionRequest{
 		EntryProtocol:  "openai",
 		ExitProtocol:   "openai",
-		Model:          cfg.Model,
+		Model:          providerCfg.Model,
 		Stream:         false,
 		Body:           body,
 		Headers:        http.Header{"Content-Type": []string{"application/json"}},
-		ForcedProvider: "codex",
+		ForcedProvider: forcedProvider,
 		AuthID:         auth.ID,
 	})
 	if errCall != nil {
@@ -561,7 +818,8 @@ func (w *warmer) Status() warmerStatus {
 		Plugin:        pluginID,
 		Version:       pluginVersion,
 		Running:       w.running,
-		Model:         cfg.Model,
+		Codex:         cfg.Codex,
+		Antigravity:   cfg.Antigravity,
 		Timezone:      cfg.Timezone,
 		Schedules:     next,
 		LastRun:       lastRun,
@@ -606,6 +864,101 @@ func (w *warmer) Logs() []logEntry {
 	return logs
 }
 
+// LogsPage returns filtered logs in reverse chronological order (newest first) along with pagination metadata.
+// When both page and pageSize are <= 0 and no filters are provided, all logs are returned in chronological order
+// for legacy API callers while still populating pagination metadata.
+func (w *warmer) LogsPage(page, pageSize int, level, query string) logPage {
+	w.mu.RLock()
+	snapshot := make([]logEntry, len(w.logs))
+	copy(snapshot, w.logs)
+	w.mu.RUnlock()
+
+	normLevel := strings.ToLower(strings.TrimSpace(level))
+	if normLevel == "all" {
+		normLevel = ""
+	}
+	normQuery := strings.ToLower(strings.TrimSpace(query))
+
+	if page <= 0 && pageSize <= 0 && normLevel == "" && normQuery == "" {
+		total := len(snapshot)
+		effectiveSize := total
+		if effectiveSize == 0 {
+			effectiveSize = defaultLogPageSize
+		}
+		return logPage{
+			Logs:       snapshot,
+			Total:      total,
+			Page:       1,
+			PageSize:   effectiveSize,
+			TotalPages: 1,
+		}
+	}
+
+	filtered := make([]logEntry, 0, len(snapshot))
+	for i := len(snapshot) - 1; i >= 0; i-- {
+		entry := snapshot[i]
+		if normLevel != "" && !strings.EqualFold(entry.Level, normLevel) {
+			continue
+		}
+		if normQuery != "" && !logEntryMatches(entry, normQuery) {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+
+	total := len(filtered)
+	if pageSize <= 0 {
+		pageSize = defaultLogPageSize
+	}
+	if pageSize > maxLogPageSize {
+		pageSize = maxLogPageSize
+	}
+	totalPages := 1
+	if total > 0 {
+		totalPages = (total + pageSize - 1) / pageSize
+	}
+	if page <= 0 {
+		page = 1
+	}
+	if page > totalPages {
+		page = totalPages
+	}
+
+	start := (page - 1) * pageSize
+	if start >= total {
+		return logPage{
+			Logs:       []logEntry{},
+			Total:      total,
+			Page:       page,
+			PageSize:   pageSize,
+			TotalPages: totalPages,
+		}
+	}
+	end := min(start+pageSize, total)
+	return logPage{
+		Logs:       filtered[start:end],
+		Total:      total,
+		Page:       page,
+		PageSize:   pageSize,
+		TotalPages: totalPages,
+	}
+}
+
+func logEntryMatches(entry logEntry, needle string) bool {
+	if strings.Contains(strings.ToLower(entry.Event), needle) ||
+		strings.Contains(strings.ToLower(entry.Message), needle) ||
+		strings.Contains(strings.ToLower(entry.Level), needle) {
+		return true
+	}
+	if len(entry.Fields) > 0 {
+		encoded, err := json.Marshal(entry.Fields)
+		if err == nil && strings.Contains(strings.ToLower(string(encoded)), needle) {
+			return true
+		}
+	}
+	return false
+}
+
 func (w *warmer) recordLog(level, event, message string, fields map[string]any) {
 	w.mu.Lock()
 	w.appendLogLocked(level, event, message, fields)
@@ -633,10 +986,10 @@ func hostLogMessage(event, message string, fields map[string]any) string {
 	case "schedule.triggered":
 		return fmt.Sprintf("%s source=%q scheduled_at=%v", message, fields["source"], fields["scheduled_at"])
 	case "warmup.selection":
-		return fmt.Sprintf("%s source=%q auth_total=%v codex_total=%v selected=%v skipped_disabled=%v reported_unavailable=%v reported_inactive=%v skipped_missing_id=%v", message, fields["source"], fields["auth_total"], fields["codex_total"], fields["selected_count"], fields["skipped_disabled"], fields["reported_unavailable"], fields["reported_inactive"], fields["skipped_missing_id"])
+		return fmt.Sprintf("%s source=%q auth_total=%v codex_total=%v antigravity_total=%v selected=%v skipped_disabled=%v reported_unavailable=%v reported_inactive=%v skipped_missing_id=%v", message, fields["source"], fields["auth_total"], fields["codex_total"], fields["antigravity_total"], fields["selected_count"], fields["skipped_disabled"], fields["reported_unavailable"], fields["reported_inactive"], fields["skipped_missing_id"])
 	case "warmup.finished":
 		return fmt.Sprintf("%s source=%q credential_count=%v success_count=%v failure_count=%v", message, fields["source"], fields["credential_count"], fields["success_count"], fields["failure_count"])
-	case "warmup.started", "warmup.no_credentials", "warmup.auth_list_failed", "warmup.credential", "schedule.failed":
+	case "warmup.started", "warmup.no_credentials", "warmup.no_providers_enabled", "warmup.auth_list_failed", "warmup.credential", "schedule.failed":
 		return fmt.Sprintf("%s source=%q", message, fields["source"])
 	default:
 		return message
@@ -706,8 +1059,8 @@ func handleMethod(method string, raw []byte) ([]byte, error) {
 			},
 			Resources: []managementResource{{
 				Path:        "/status",
-				Menu:        "Codex Quota Warmer",
-				Description: "Schedules and runs Codex credential warm-up requests.",
+				Menu:        "Multi Quota Warmer",
+				Description: "Schedules and runs Codex and Antigravity credential warm-up requests.",
 			}},
 		})
 	case pluginabi.MethodManagementHandle:
@@ -723,11 +1076,11 @@ func pluginRegistration() registration {
 		Metadata: pluginapi.Metadata{
 			Name:             pluginName,
 			Version:          pluginVersion,
-			Author:           "Windyskr",
-			GitHubRepository: "https://github.com/Windyskr/codex-5h-quota-warmer",
+			Author:           "wvlike",
+			GitHubRepository: "https://github.com/wvlike/multi-quota-warmer",
 			ConfigFields: []pluginapi.ConfigField{
-				{Name: "model", Type: pluginapi.ConfigFieldTypeString, Description: "Codex model used for each warm-up request."},
-				{Name: "prompt", Type: pluginapi.ConfigFieldTypeString, Description: "Message sent to every enabled Codex credential."},
+				{Name: "codex", Type: pluginapi.ConfigFieldTypeObject, Description: "Codex warm-up settings (enabled, model, prompt)."},
+				{Name: "antigravity", Type: pluginapi.ConfigFieldTypeObject, Description: "Antigravity warm-up settings (enabled, model, prompt)."},
 				{Name: "timezone", Type: pluginapi.ConfigFieldTypeString, Description: "IANA timezone used by the daily schedules."},
 				{Name: "schedules", Type: pluginapi.ConfigFieldTypeArray, Description: "Daily schedule entries with id, at (HH:MM), and enabled."},
 				{Name: "max_log_entries", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum number of retained warm-up log entries."},
@@ -738,22 +1091,129 @@ func pluginRegistration() registration {
 	}
 }
 
-func handleManagement(raw []byte) ([]byte, error) {
-	var request managementRequest
-	if errUnmarshal := json.Unmarshal(raw, &request); errUnmarshal != nil {
-		return nil, fmt.Errorf("decode management request: %w", errUnmarshal)
+func decodeManagementRequest(raw []byte) (managementRequest, error) {
+	var wire managementRequestWire
+	if errUnmarshal := json.Unmarshal(raw, &wire); errUnmarshal != nil {
+		return managementRequest{}, fmt.Errorf("decode management request: %w", errUnmarshal)
 	}
-	path := strings.TrimRight(strings.TrimSpace(request.Path), "/")
+	method := strings.TrimSpace(wire.Method)
+	if method == "" {
+		method = strings.TrimSpace(wire.MethodLower)
+	}
+	rawPath := strings.TrimSpace(wire.Path)
+	if rawPath == "" {
+		rawPath = strings.TrimSpace(wire.PathLower)
+	}
+	cleanPath := rawPath
+	query := make(url.Values)
+	if basePath, inlineQuery, hasQuery := strings.Cut(rawPath, "?"); hasQuery {
+		cleanPath = basePath
+		if parsed, errParse := url.ParseQuery(inlineQuery); errParse == nil {
+			for k, vals := range parsed {
+				query[k] = append(query[k], vals...)
+			}
+		}
+	}
+	mergeRawQuery(query, wire.QueryRaw)
+	mergeRawQuery(query, wire.QueryLower)
+
+	body, errBody := decodeManagementBody(wire.BodyRaw, wire.BodyLower)
+	if errBody != nil {
+		return managementRequest{}, errBody
+	}
+	return managementRequest{
+		Method:  method,
+		Path:    strings.TrimRight(cleanPath, "/"),
+		Headers: wire.Headers,
+		Query:   query,
+		Body:    body,
+	}, nil
+}
+
+func mergeRawQuery(dst url.Values, raw json.RawMessage) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return
+	}
+	if strings.HasPrefix(trimmed, `"`) {
+		var str string
+		if err := json.Unmarshal(raw, &str); err == nil {
+			if parsed, errParse := url.ParseQuery(strings.TrimPrefix(str, "?")); errParse == nil {
+				for k, vals := range parsed {
+					dst[k] = append(dst[k], vals...)
+				}
+			}
+		}
+		return
+	}
+	var m url.Values
+	if err := json.Unmarshal(raw, &m); err == nil {
+		for k, vals := range m {
+			dst[k] = append(dst[k], vals...)
+		}
+	}
+}
+
+func decodeManagementBody(primary, fallback json.RawMessage) ([]byte, error) {
+	raw := primary
+	if len(strings.TrimSpace(string(raw))) == 0 || strings.TrimSpace(string(raw)) == "null" {
+		raw = fallback
+	}
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return nil, nil
+	}
+	if strings.HasPrefix(trimmed, `"`) {
+		var b64 string
+		if err := json.Unmarshal(raw, &b64); err != nil {
+			return nil, fmt.Errorf("decode management body string: %w", err)
+		}
+		if b64 == "" {
+			return nil, nil
+		}
+		decoded, errDec := base64.StdEncoding.DecodeString(b64)
+		if errDec != nil {
+			// Fallback to raw string bytes if host passed plain JSON-encoded text.
+			return []byte(b64), nil
+		}
+		return decoded, nil
+	}
+	return append([]byte(nil), raw...), nil
+}
+
+func handleManagement(raw []byte) ([]byte, error) {
+	return handleManagementWithWarmer(globalWarmer, raw)
+}
+
+func handleManagementWithWarmer(w *warmer, raw []byte) ([]byte, error) {
+	request, errDecode := decodeManagementRequest(raw)
+	if errDecode != nil {
+		return nil, errDecode
+	}
+	path := request.Path
 	switch {
 	case strings.HasSuffix(path, "/status"):
 		if strings.HasPrefix(path, "/v0/resource/") {
 			return okEnvelope(htmlResponse(http.StatusOK, []byte(statusPageHTML)))
 		}
-		return okEnvelope(jsonResponse(http.StatusOK, globalWarmer.Status()))
+		return okEnvelope(jsonResponse(http.StatusOK, w.Status()))
 	case strings.HasSuffix(path, "/logs"):
-		return okEnvelope(jsonResponse(http.StatusOK, map[string]any{"logs": globalWarmer.Logs()}))
+		page, _ := strconv.Atoi(strings.TrimSpace(request.Query.Get("page")))
+		pageSize, _ := strconv.Atoi(strings.TrimSpace(request.Query.Get("page_size")))
+		level := request.Query.Get("level")
+		queryText := request.Query.Get("q")
+		return okEnvelope(jsonResponse(http.StatusOK, w.LogsPage(page, pageSize, level, queryText)))
 	case strings.HasSuffix(path, "/run"):
-		results, errRun := globalWarmer.Run("manual")
+		targetProvider := strings.TrimSpace(request.Query.Get("provider"))
+		if targetProvider == "" && len(request.Body) > 0 {
+			var bodyReq struct {
+				Provider string `json:"provider"`
+			}
+			if errJSON := json.Unmarshal(request.Body, &bodyReq); errJSON == nil {
+				targetProvider = strings.TrimSpace(bodyReq.Provider)
+			}
+		}
+		results, errRun := w.Run("manual", targetProvider)
 		if errRun != nil {
 			status := http.StatusInternalServerError
 			var statusCoder interface{ StatusCode() int }
@@ -762,7 +1222,7 @@ func handleManagement(raw []byte) ([]byte, error) {
 			}
 			return okEnvelope(jsonResponse(status, map[string]any{"error": errRun.Error()}))
 		}
-		return okEnvelope(jsonResponse(http.StatusOK, map[string]any{"results": results, "status": globalWarmer.Status()}))
+		return okEnvelope(jsonResponse(http.StatusOK, map[string]any{"results": results, "status": w.Status()}))
 	default:
 		return okEnvelope(jsonResponse(http.StatusNotFound, map[string]any{"error": "route_not_found"}))
 	}

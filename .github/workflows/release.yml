@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 env:
-  PLUGIN_ID: codex-5h-quota-warmer
+  PLUGIN_ID: multi-quota-warmer
 
 jobs:
   verify:
@@ -22,7 +22,9 @@ jobs:
           cache-dependency-path: go/go.sum
       - name: Check Go code
         working-directory: go
-        run: go vet ./...
+        run: |
+          go vet ./...
+          go test ./...
 
   build:
     needs: verify

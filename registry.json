@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "multi-quota-warmer",
+      "name": "Multi-Provider Five-Hour Quota Warmer",
+      "description": "Schedules and runs daily five-hour quota warm-up requests for active Codex and Antigravity credentials in CLIProxyAPI.",
+      "author": "wvlike",
+      "version": "0.3.0",
+      "repository": "https://github.com/wvlike/multi-quota-warmer",
+      "homepage": "https://github.com/wvlike/multi-quota-warmer",
+      "license": "MIT",
+      "tags": ["codex", "antigravity", "quota", "warmer", "cliproxyapi"]
+    }
+  ]
+}
